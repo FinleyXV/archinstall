@@ -13,6 +13,15 @@ from typing import Any, Self
 
 from archinstall.lib.boot import Boot
 from archinstall.lib.bootloader.utils import validate_bootloader_layout
+from archinstall.lib.cachyos import (
+	CACHYOS_KEY_ID,
+	CACHYOS_KEYRING_PACKAGE,
+	CACHYOS_KEYSERVER,
+	CACHYOS_MIRRORLIST,
+	cachyos_mirrorlist,
+	insert_cachyos_repo,
+	is_cachyos_kernel,
+)
 from archinstall.lib.command import SysCommand, run
 from archinstall.lib.disk.fido import Fido2
 from archinstall.lib.disk.luks import Luks2, unlock_luks2_dev
@@ -72,7 +81,48 @@ from archinstall.lib.translationhandler import tr
 # pacman picks the first initramfs provider from the host's pacman.conf, which on non-Arch
 # hosts (EndeavourOS prefers dracut, etc.) breaks the installer's mkinitcpio() and
 # _config_uki() methods that assume mkinitcpio is present in the chroot.
-__packages__ = ['base', 'sudo', 'linux-firmware', 'mkinitcpio'] + [k.value for k in Kernel]
+# The `base` meta-package hard-depends on coreutils and we ship uutils-coreutils instead, so its
+# hard dependencies are listed explicitly without coreutils. `bash` stays because /bin/sh and many
+# system scripts need it, fish is the interactive shell (see Installer.create_users and minimal_installation).
+__base_packages__ = [
+	'archlinux-keyring',
+	'bash',
+	'bzip2',
+	'file',
+	'filesystem',
+	'findutils',
+	'fish',
+	'gawk',
+	'gcc-libs',
+	'gettext',
+	'glibc',
+	'grep',
+	'gzip',
+	'iproute2',
+	'iputils',
+	'licenses',
+	'pacman',
+	'pciutils',
+	'procps-ng',
+	'psmisc',
+	'sed',
+	'shadow',
+	'systemd',
+	'systemd-sysvcompat',
+	'tar',
+	'util-linux',
+	'uutils-coreutils',
+	'xz',
+	'sudo-rs',
+	'ntpd-rs',
+	'linux-firmware',
+	'mkinitcpio',
+]
+
+__packages__ = __base_packages__ + [k.value for k in Kernel]
+
+# Shell given to root and every created user
+DEFAULT_LOGIN_SHELL = '/usr/bin/fish'
 
 # Additional packages that are installed if the user is running the Live ISO with accessibility tools enabled
 __accessibility_packages__ = ['brltty', 'espeakup', 'alsa-utils']
@@ -92,7 +142,7 @@ class Installer:
 		`Installer()` is the wrapper for most basic installation steps.
 		It also wraps :py:func:`~archinstall.Installer.pacstrap` among other things.
 		"""
-		self._base_packages = base_packages or __packages__[:4]
+		self._base_packages = list(base_packages or __base_packages__)
 		self.kernels = kernels or [DEFAULT_KERNEL.value]
 		self._disk_config = disk_config
 
@@ -105,8 +155,10 @@ class Installer:
 			'bootloader': None,
 		}
 
+		# CachyOS kernels are not in the Arch repositories, they are installed by _setup_cachyos()
 		for kernel in self.kernels:
-			self._base_packages.append(kernel)
+			if not is_cachyos_kernel(kernel):
+				self._base_packages.append(kernel)
 
 		# Optional firmware is strapped with base so the blobs are in place before the initramfs is generated
 		self._base_packages.extend(firmware or [])
@@ -699,8 +751,92 @@ class Installer:
 		return False
 
 	def activate_time_synchronization(self) -> None:
-		info('Activating systemd-timesyncd for time synchronization using Arch Linux and ntp.org NTP servers')
-		self.enable_service('systemd-timesyncd')
+		info('Activating ntpd-rs for time synchronization')
+		# ntpd-rs conflicts with systemd-timesyncd, so make sure the latter stays off
+		self.disable_service('systemd-timesyncd')
+		self.enable_service('ntpd-rs')
+
+	def _link_uutils_applets(self) -> None:
+		"""
+		uutils-coreutils ships one multicall binary. Anything in /usr/bin that is still
+		missing its GNU name gets a link to it, so scripts that call `ls`, `cp`, `[` and
+		friends keep working.
+		"""
+		multicall = self.target / 'usr/bin/coreutils'
+		if not multicall.exists():
+			warn('uutils-coreutils did not install /usr/bin/coreutils, the GNU command names were not linked')
+			return
+
+		info('Linking uutils-coreutils applets')
+		applets = self.arch_chroot('coreutils --list').decode()
+
+		for applet in applets.split():
+			if not re.fullmatch(r'[A-Za-z0-9_.\[-]+', applet) or applet == 'coreutils':
+				continue
+
+			link = self.target / 'usr/bin' / applet
+			if not link.exists() and not link.is_symlink():
+				link.symlink_to('coreutils')
+
+	def _setup_cachyos(self) -> None:
+		"""
+		Adds the CachyOS repository to the target and installs the CachyOS keyring, plus any
+		CachyOS kernels that were selected. See archinstall/lib/cachyos.py for why this happens
+		after pacstrap.
+		"""
+		cachyos_kernels = [k for k in self.kernels if is_cachyos_kernel(k)]
+
+		info('Enabling the CachyOS repository')
+
+		try:
+			pacman_conf = self.target / PACMAN_CONF.relative_to_root()
+			pacman_conf.write_text(insert_cachyos_repo(pacman_conf.read_text()))
+
+			mirrorlist = self.target / CACHYOS_MIRRORLIST.relative_to('/')
+			mirrorlist.parent.mkdir(parents=True, exist_ok=True)
+			mirrorlist.write_text(cachyos_mirrorlist())
+
+			self.arch_chroot(f'pacman-key --recv-keys {CACHYOS_KEY_ID} --keyserver {CACHYOS_KEYSERVER}')
+			self.arch_chroot(f'pacman-key --lsign-key {CACHYOS_KEY_ID}')
+
+			install = ' '.join([CACHYOS_KEYRING_PACKAGE, *cachyos_kernels])
+			self.arch_chroot(f'pacman -Sy --noconfirm --needed {install}')
+		except (SysCallError, CalledProcessError, OSError) as err:
+			if cachyos_kernels:
+				raise RequirementError(f'Could not install the CachyOS kernel {cachyos_kernels}: {err}')
+			warn(f'Could not enable the CachyOS repository, continuing without it: {err}')
+
+	def _set_default_shells(self) -> None:
+		"""
+		Makes fish the login shell for root. Users created later get the same shell.
+		/etc/shells must list the shell or chsh refuses it.
+		"""
+		shells = self.target / 'etc/shells'
+		entries = shells.read_text().splitlines() if shells.exists() else []
+		if DEFAULT_LOGIN_SHELL not in entries:
+			shells.write_text('\n'.join([*entries, DEFAULT_LOGIN_SHELL]) + '\n')
+
+		self.user_set_shell('root', DEFAULT_LOGIN_SHELL)
+
+	def restrict_virtual_terminals(self) -> None:
+		"""
+		Only virtual terminals 1 and 2 stay usable. Dynamic allocation is limited to two and the
+		getty and autovt units for every other tty are masked.
+		"""
+		info('Disabling virtual terminals other than tty1 and tty2')
+
+		dropin = self.target / 'etc/systemd/logind.conf.d/50-vt-limit.conf'
+		dropin.parent.mkdir(parents=True, exist_ok=True)
+		dropin.write_text('[Login]\nNAutoVTs=2\n')
+
+		system_dir = self.target / 'etc/systemd/system'
+		system_dir.mkdir(parents=True, exist_ok=True)
+
+		for vt in range(3, 64):
+			for unit in (f'getty@tty{vt}.service', f'autovt@tty{vt}.service'):
+				mask = system_dir / unit
+				mask.unlink(missing_ok=True)
+				mask.symlink_to('/dev/null')
 
 	def enable_espeakup(self) -> None:
 		info('Enabling espeakup.service for speech synthesis (accessibility)')
@@ -939,10 +1075,16 @@ class Installer:
 		self.pacman.strap(self._base_packages)
 		self._helper_flags['base-strapped'] = True
 
+		self._link_uutils_applets()
+
 		pacman_conf.persist()
+
+		self._setup_cachyos()
 
 		if pacman_config:
 			pacman_conf.configure(pacman_config)
+
+		self._set_default_shells()
 
 		# Periodic TRIM may improve the performance and longevity of SSDs whilst
 		# having no adverse effect on other devices. Most distributions enable
@@ -976,6 +1118,8 @@ class Installer:
 			function(self)
 
 		self.enable_service(self._post_base_install_services)
+
+		self.restrict_virtual_terminals()
 
 		for plugin in plugins.values():
 			if hasattr(plugin, 'on_install'):
@@ -1981,6 +2125,7 @@ class Installer:
 					handled_by_plugin = result
 
 		self.set_user_password(user)
+		self.user_set_shell(user.username, DEFAULT_LOGIN_SHELL)
 
 		for group in user.groups:
 			cmd = self._chroot_argv('gpasswd', '-a', user.username, group)
