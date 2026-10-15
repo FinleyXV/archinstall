@@ -2,24 +2,23 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import textwrap
 import time
 from collections.abc import Callable
 from pathlib import Path
 from subprocess import CalledProcessError
+from tempfile import TemporaryDirectory
 from types import TracebackType
 from typing import Any, Self
 
 from archinstall.lib.boot import Boot
 from archinstall.lib.bootloader.utils import validate_bootloader_layout
 from archinstall.lib.cachyos import (
-	CACHYOS_KEY_ID,
-	CACHYOS_KEYRING_PACKAGE,
-	CACHYOS_KEYSERVER,
-	CACHYOS_MIRRORLIST,
-	cachyos_mirrorlist,
-	insert_cachyos_repo,
+	CACHYOS_REPO_TARBALL,
+	cachyos_script_shell,
+	find_cachyos_script,
 	is_cachyos_kernel,
 )
 from archinstall.lib.command import SysCommand, run
@@ -780,31 +779,37 @@ class Installer:
 
 	def _setup_cachyos(self) -> None:
 		"""
-		Adds the CachyOS repository to the target and installs the CachyOS keyring, plus any
-		CachyOS kernels that were selected. See archinstall/lib/cachyos.py for why this happens
-		after pacstrap.
+		Runs the official cachyos-repo.sh inside the target, then installs any CachyOS kernels
+		that were selected. It runs after pacstrap, see archinstall/lib/cachyos.py for why.
 		"""
 		cachyos_kernels = [k for k in self.kernels if is_cachyos_kernel(k)]
 
-		info('Enabling the CachyOS repository')
+		info('Enabling the CachyOS repository with cachyos-repo.sh')
 
+		extract = self.target / 'var/tmp/cachyos-repo'
 		try:
-			pacman_conf = self.target / PACMAN_CONF.relative_to_root()
-			pacman_conf.write_text(insert_cachyos_repo(pacman_conf.read_text()))
+			with TemporaryDirectory() as tmp:
+				tarball = Path(tmp) / 'cachyos-repo.tar.xz'
+				run(['curl', '-fsSL', '-o', str(tarball), CACHYOS_REPO_TARBALL])
 
-			mirrorlist = self.target / CACHYOS_MIRRORLIST.relative_to('/')
-			mirrorlist.parent.mkdir(parents=True, exist_ok=True)
-			mirrorlist.write_text(cachyos_mirrorlist())
+				extract.mkdir(parents=True, exist_ok=True)
+				run(['tar', '-xJf', str(tarball), '-C', str(extract)])
 
-			self.arch_chroot(f'pacman-key --recv-keys {CACHYOS_KEY_ID} --keyserver {CACHYOS_KEYSERVER}')
-			self.arch_chroot(f'pacman-key --lsign-key {CACHYOS_KEY_ID}')
+			script = find_cachyos_script(extract)
+			if script is None:
+				raise RequirementError('cachyos-repo.sh was not found in the CachyOS tarball')
 
-			install = ' '.join([CACHYOS_KEYRING_PACKAGE, *cachyos_kernels])
-			self.arch_chroot(f'pacman -Sy --noconfirm --needed {install}')
-		except (SysCallError, CalledProcessError, OSError) as err:
+			script_in_chroot = '/' + str(script.relative_to(self.target))
+			self.arch_chroot(f'bash -c {shlex.quote(cachyos_script_shell(script_in_chroot))}')
+
+			if cachyos_kernels:
+				self.arch_chroot(f'pacman -Sy --noconfirm --needed {" ".join(cachyos_kernels)}')
+		except (SysCallError, CalledProcessError, OSError, RequirementError) as err:
 			if cachyos_kernels:
 				raise RequirementError(f'Could not install the CachyOS kernel {cachyos_kernels}: {err}')
 			warn(f'Could not enable the CachyOS repository, continuing without it: {err}')
+		finally:
+			shutil.rmtree(extract, ignore_errors=True)
 
 	def _set_default_shells(self) -> None:
 		"""
