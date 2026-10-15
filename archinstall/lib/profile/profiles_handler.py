@@ -8,6 +8,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
 from archinstall.default_profiles.profile import CustomSetting, GreeterType, Profile
+from archinstall.lib.cachyos import is_cachyos_kernel
 from archinstall.lib.hardware import GfxDriver, GfxPackage
 from archinstall.lib.log import debug, error, info
 from archinstall.lib.models.profile import ProfileConfiguration
@@ -227,8 +228,15 @@ class ProfileHandler:
 			needs_dkms = any('-' in k for k in install_session.kernels)
 
 			if needs_dkms:
-				headers = [f'{kernel}-headers' for kernel in install_session.kernels]
-				install_session.add_additional_packages(headers)
+				headers = []
+				for kernel in install_session.kernels:
+					if is_cachyos_kernel(kernel):
+						# pacstrap cannot see the CachyOS repository, so these come from inside the chroot
+						install_session.arch_chroot(f'pacman -S --noconfirm --needed {kernel}-headers')
+					else:
+						headers.append(f'{kernel}-headers')
+				if headers:
+					install_session.add_additional_packages(headers)
 			else:
 				pkg_names = [GfxPackage.NvidiaOpen.value if p == GfxPackage.NvidiaOpenDkms.value else p for p in pkg_names]
 				pkg_names = [p for p in pkg_names if p != GfxPackage.Dkms.value]

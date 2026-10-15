@@ -15,7 +15,7 @@ class Kernel(StrEnum):
 	LINUX_CACHYOS = 'linux-cachyos'
 
 
-DEFAULT_KERNEL: Final = Kernel.LINUX
+DEFAULT_KERNEL: Final = Kernel.LINUX_CACHYOS
 
 
 class FirmwareOptdep(StrEnum):

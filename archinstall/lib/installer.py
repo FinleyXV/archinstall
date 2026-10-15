@@ -17,9 +17,16 @@ from archinstall.lib.boot import Boot
 from archinstall.lib.bootloader.utils import validate_bootloader_layout
 from archinstall.lib.cachyos import (
 	CACHYOS_REPO_TARBALL,
+	SCX_CONFIG,
+	SCX_CONFIG_TEMPLATE,
+	SCX_MODE,
+	SCX_PACKAGES,
+	SCX_SCHEDULER,
+	SCX_SERVICE,
 	cachyos_script_shell,
 	find_cachyos_script,
 	is_cachyos_kernel,
+	sched_ext_config,
 )
 from archinstall.lib.command import SysCommand, run
 from archinstall.lib.disk.fido import Fido2
@@ -811,6 +818,25 @@ class Installer:
 		finally:
 			shutil.rmtree(extract, ignore_errors=True)
 
+	def _setup_sched_ext(self) -> None:
+		"""
+		Installs the sched_ext schedulers from the CachyOS repository and enables scx_loader with
+		the default scheduler. Needs the CachyOS repository, so it runs after _setup_cachyos().
+		"""
+		info('Installing sched_ext schedulers and enabling scx_loader')
+
+		try:
+			self.arch_chroot(f'pacman -S --noconfirm --needed {" ".join(SCX_PACKAGES)}')
+
+			template = self.target / SCX_CONFIG_TEMPLATE
+			config = self.target / SCX_CONFIG
+			config.parent.mkdir(parents=True, exist_ok=True)
+			config.write_text(sched_ext_config(template.read_text(), SCX_SCHEDULER, SCX_MODE))
+
+			self.enable_service(SCX_SERVICE)
+		except (SysCallError, ServiceExceptionError, OSError) as err:
+			warn(f'Could not set up sched_ext, continuing without it: {err}')
+
 	def _set_default_shells(self) -> None:
 		"""
 		Makes fish the login shell for root. Users created later get the same shell.
@@ -1085,6 +1111,7 @@ class Installer:
 		pacman_conf.persist()
 
 		self._setup_cachyos()
+		self._setup_sched_ext()
 
 		if pacman_config:
 			pacman_conf.configure(pacman_config)
