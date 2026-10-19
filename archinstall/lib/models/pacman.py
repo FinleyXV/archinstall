@@ -10,7 +10,7 @@ class PacmanConfigSerialization(TypedDict):
 	color: bool
 
 
-DEFAULT_PARALLEL_DOWNLOADS = 5
+DEFAULT_PARALLEL_DOWNLOADS = 10
 
 
 @dataclass

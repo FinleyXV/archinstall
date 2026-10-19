@@ -70,7 +70,7 @@ def _apply_to_live(parallel_downloads: int) -> None:
 				fwrite.write(f'{line}\n')
 
 
-async def select_parallel_downloads(preset: int = 5) -> int | None:
+async def select_parallel_downloads(preset: int = 10) -> int | None:
 	max_recommended = 10
 
 	header = tr('Enter the number of parallel downloads (1-{})').format(max_recommended)

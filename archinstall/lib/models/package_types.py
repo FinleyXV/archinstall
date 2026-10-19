@@ -11,9 +11,11 @@ class Kernel(StrEnum):
 	LINUX_HARDENED = 'linux-hardened'
 	LINUX_RT = 'linux-rt'
 	LINUX_RT_LTS = 'linux-rt-lts'
+	# Lives in the CachyOS repositories, installed by Installer._setup_cachyos()
+	LINUX_CACHYOS = 'linux-cachyos'
 
 
-DEFAULT_KERNEL: Final = Kernel.LINUX
+DEFAULT_KERNEL: Final = Kernel.LINUX_CACHYOS
 
 
 class FirmwareOptdep(StrEnum):
